@@ -1,0 +1,367 @@
+<meta charset="utf-8">
+<title>모터 가우시안 뷰어 (구면조화)</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin:0; height:100%; background:#0b0d10; overflow:hidden;
+               font:13px/1.5 "Segoe UI", system-ui, sans-serif; color:#e6e8ea; }
+  canvas { display:block; width:100%; height:100%; cursor:grab; }
+  canvas:active { cursor:grabbing; }
+  #hud { position:fixed; left:14px; top:14px; padding:10px 13px;
+         background:rgba(14,17,21,.82); border:1px solid #2a2f36; border-radius:8px;
+         backdrop-filter:blur(6px); max-width:250px; }
+  #hud b { color:#7fd1ff; font-weight:600; }
+  #hud .k { color:#9aa3ad; }
+  #hud hr { border:0; border-top:1px solid #262b31; margin:8px 0; }
+  #err { color:#ff9b9b; }
+  button { background:#1b2027; color:#dfe4e9; border:1px solid #333a43;
+           border-radius:6px; padding:4px 9px; cursor:pointer; font:inherit; }
+  button:hover { background:#232a33; }
+  #load { position:fixed; inset:0; display:grid; place-items:center;
+          background:#0b0d10; font-size:15px; color:#9aa3ad; }
+</style>
+
+<canvas id="cv"></canvas>
+<div id="hud">
+  <div><b id="n">…</b> 개의 가우시안</div>
+  <div class="k" id="fps">—</div>
+  <hr>
+  <div class="k">
+    끌기 &nbsp;— 회전<br>
+    휠 &nbsp;&nbsp;&nbsp;&nbsp;— 확대<br>
+    우클릭 끌기 — 이동
+  </div>
+  <hr>
+  <button id="reset">시점 초기화</button>
+  <div id="err"></div>
+</div>
+<div id="load">모델 읽는 중…</div>
+
+<script>
+// 3D 가우시안 스플래팅 뷰어 — 구면조화 3차 포함 (WebGL2, 의존성 없음)
+//
+// 기본색만 쓰는 버전과 다른 점 하나: 가우시안마다 색 계수를 16개(채널당) 들고
+// 있다가, 보는 방향에 따라 색을 다시 계산한다. 금속 반사와 하이라이트가
+// 거기서 나온다. render.py 가 하는 것과 같은 계산이다.
+//
+// 3D 공분산은 셰이더가 아니라 JS 에서 만든다. GLSL 의 mat3 는 열 우선이라
+// 쿼터니언→행렬 순서를 헷갈리면 조용히 찌그러진 결과가 나온다.
+
+const CV = document.getElementById("cv");
+const gl = CV.getContext("webgl2", { antialias:false, alpha:false, premultipliedAlpha:true });
+if (!gl) { document.getElementById("load").textContent = "WebGL2를 못 씁니다."; throw 0; }
+
+const VS = `#version 300 es
+precision highp float; precision highp int;
+
+uniform sampler2D uPos;    // xyz, alpha
+uniform sampler2D uCovA;   // s00 s01 s02
+uniform sampler2D uCovB;   // s11 s12 s22
+uniform sampler2D uSH;     // 계수 16개 x RGB, 가우시안당 16텍셀
+uniform int  uTexW;
+uniform int  uShW;
+uniform mat3 uR;
+uniform vec3 uEye;
+uniform vec2 uFocal;
+uniform vec2 uSize;
+
+in vec2 aCorner;
+in float aIdx;
+
+out vec3 vCol;
+out float vA;
+out vec2 vG;
+
+const float C0 = 0.28209479177387814;
+const float C1 = 0.4886025119029199;
+const float C2_0 = 1.0925484305920792, C2_2 = 0.31539156525252005,
+            C2_4 = 0.5462742152960396;
+const float C3_0 = -0.5900435899266435, C3_1 = 2.890611442640554,
+            C3_2 = -0.4570457994644658, C3_3 = 0.3731763325901154,
+            C3_5 = 1.445305721320277;
+
+vec3 shAt(int i, int k) {
+  int t = i*16 + k;
+  return texelFetch(uSH, ivec2(t % uShW, t / uShW), 0).rgb;
+}
+
+void main() {
+  int i = int(aIdx);
+  ivec2 uv = ivec2(i % uTexW, i / uTexW);
+  vec4 p  = texelFetch(uPos,  uv, 0);
+  vec3 a  = texelFetch(uCovA, uv, 0).xyz;
+  vec3 b  = texelFetch(uCovB, uv, 0).xyz;
+  vA      = p.w;
+
+  vec3 t = uR * (p.xyz - uEye);
+  if (t.z < 0.05) { gl_Position = vec4(2.,2.,2.,1.); return; }
+
+  // ---- 구면조화 3차 ----
+  vec3 d = normalize(p.xyz - uEye);
+  float x = d.x, y = d.y, z = d.z;
+  vec3 c = C0 * shAt(i,0);
+  c += -C1*y*shAt(i,1) + C1*z*shAt(i,2) - C1*x*shAt(i,3);
+  float xx=x*x, yy=y*y, zz=z*z, xy=x*y, yz=y*z, xz=x*z;
+  c += C2_0*xy*shAt(i,4) + (-C2_0)*yz*shAt(i,5) + C2_2*(2.0*zz-xx-yy)*shAt(i,6)
+     + (-C2_0)*xz*shAt(i,7) + C2_4*(xx-yy)*shAt(i,8);
+  c += C3_0*y*(3.0*xx-yy)*shAt(i,9) + C3_1*xy*z*shAt(i,10)
+     + C3_2*y*(4.0*zz-xx-yy)*shAt(i,11)
+     + C3_3*z*(2.0*zz-3.0*xx-3.0*yy)*shAt(i,12)
+     + C3_2*x*(4.0*zz-xx-yy)*shAt(i,13)
+     + C3_5*z*(xx-yy)*shAt(i,14) + C3_0*x*(xx-3.0*yy)*shAt(i,15);
+  vCol = max(c + 0.5, 0.0);
+
+  float iz = 1.0 / t.z;
+  mat3x2 J = mat3x2(
+    uFocal.x*iz, 0.0,
+    0.0,         uFocal.y*iz,
+    -uFocal.x*t.x*iz*iz, -uFocal.y*t.y*iz*iz);
+
+  mat3 S = mat3(a.x, a.y, a.z,
+                a.y, b.x, b.y,
+                a.z, b.y, b.z);
+  mat3 W = uR * S * transpose(uR);
+  mat2 C = J * W * transpose(J);
+  C[0][0] += 0.3; C[1][1] += 0.3;
+
+  float mid = 0.5*(C[0][0] + C[1][1]);
+  float rad = sqrt(max(mid*mid - (C[0][0]*C[1][1] - C[0][1]*C[1][0]), 0.0));
+  float l1 = mid + rad, l2 = max(mid - rad, 0.1);
+  vec2 e1 = abs(C[0][1]) < 1e-9 ? vec2(1.0,0.0)
+                                : normalize(vec2(C[0][1], l1 - C[0][0]));
+  vec2 e2 = vec2(-e1.y, e1.x);
+
+  vG = aCorner * 3.0;
+  vec2 off = vG.x*sqrt(l1)*e1 + vG.y*sqrt(l2)*e2;
+  vec2 ndc = vec2(uFocal.x*t.x*iz, uFocal.y*t.y*iz) / (uSize*0.5);
+  gl_Position = vec4(ndc.x + off.x*2.0/uSize.x,
+                    -(ndc.y + off.y*2.0/uSize.y), 0.0, 1.0);
+}`;
+
+const FS = `#version 300 es
+precision highp float;
+in vec3 vCol; in float vA; in vec2 vG;
+out vec4 frag;
+void main() {
+  float d2 = dot(vG, vG);
+  if (d2 > 9.0) discard;
+  float a = vA * exp(-0.5*d2);
+  if (a < 0.004) discard;
+  frag = vec4(vCol*a, a);
+}`;
+
+function sh_(type, src) {
+  const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, sh_(gl.VERTEX_SHADER, VS));
+gl.attachShader(prog, sh_(gl.FRAGMENT_SHADER, FS));
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+gl.useProgram(prog);
+const U = n => gl.getUniformLocation(prog, n);
+
+let N=0, TW=0, SHW=0, cx=0, cy=0, cz=0, radius=1;
+let posArr, depthArr, orderBuf, idxBuf;
+
+function texF(unit, data, w, h) {
+  const t = gl.createTexture();
+  gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, t);
+  for (const p of [gl.TEXTURE_MIN_FILTER, gl.TEXTURE_MAG_FILTER])
+    gl.texParameteri(gl.TEXTURE_2D, p, gl.NEAREST);
+  for (const p of [gl.TEXTURE_WRAP_S, gl.TEXTURE_WRAP_T])
+    gl.texParameteri(gl.TEXTURE_2D, p, gl.CLAMP_TO_EDGE);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, w, h, 0, gl.RGBA, gl.FLOAT, data);
+  return t;
+}
+
+function build(buf) {
+  const head = new Uint8Array(buf, 0, 8);
+  const magic = String.fromCharCode(...head);
+  if (magic !== "SPLATSH1") throw new Error("형식이 다릅니다: " + magic);
+  const dv = new DataView(buf);
+  const n = dv.getUint32(8, true);
+  const RANGE = dv.getFloat32(12, true);
+  // DC 는 기본색이라 범위가 넓다(실측 -2.3~5.1). 구면조화와 같은 배율로
+  // 눌렀다가 69%가 잘려서 흰 섬광이 생겼었다.
+  const DCR = dv.getFloat32(16, true);
+  N = n;
+
+  const BASE = 20;
+  const SHOFF = BASE + n*32;
+  const f32 = new Float32Array(buf, BASE, n*8);
+  const u8  = new Uint8Array(buf, BASE, n*32);
+  const shu = new Uint8Array(buf, SHOFF, n*45);
+
+  TW = 2048;
+  const TH = Math.ceil(n / TW);
+  const P = new Float32Array(TW*TH*4), A = new Float32Array(TW*TH*4),
+        B = new Float32Array(TW*TH*4);
+  // 구면조화: 가우시안당 16텍셀 (계수 16개, 각 RGB)
+  SHW = 2048;
+  const SHH = Math.ceil(n*16 / SHW);
+  const SH = new Float32Array(SHW*SHH*4);
+  posArr = new Float32Array(n*3);
+  let mnx=1e9,mny=1e9,mnz=1e9,mxx=-1e9,mxy=-1e9,mxz=-1e9;
+
+  for (let i = 0; i < n; i++) {
+    const fo = i*8, bo = i*32;
+    const x = f32[fo], y = f32[fo+1], z = f32[fo+2];
+    const sx = f32[fo+3], sy = f32[fo+4], sz = f32[fo+5];
+    posArr[i*3]=x; posArr[i*3+1]=y; posArr[i*3+2]=z;
+    if(x<mnx)mnx=x; if(y<mny)mny=y; if(z<mnz)mnz=z;
+    if(x>mxx)mxx=x; if(y>mxy)mxy=y; if(z>mxz)mxz=z;
+
+    let qw=(u8[bo+28]-128)/128, qx=(u8[bo+29]-128)/128,
+        qy=(u8[bo+30]-128)/128, qz=(u8[bo+31]-128)/128;
+    const ql = Math.hypot(qw,qx,qy,qz) || 1;
+    qw/=ql; qx/=ql; qy/=ql; qz/=ql;
+    const r00=1-2*(qy*qy+qz*qz), r01=2*(qx*qy-qw*qz), r02=2*(qx*qz+qw*qy);
+    const r10=2*(qx*qy+qw*qz), r11=1-2*(qx*qx+qz*qz), r12=2*(qy*qz-qw*qx);
+    const r20=2*(qx*qz-qw*qy), r21=2*(qy*qz+qw*qx), r22=1-2*(qx*qx+qy*qy);
+    const a2=sx*sx, b2=sy*sy, c2=sz*sz;
+    const o = i*4;
+    P[o]=x; P[o+1]=y; P[o+2]=z; P[o+3]=u8[bo+27]/255;
+    A[o]=r00*r00*a2 + r01*r01*b2 + r02*r02*c2;
+    A[o+1]=r00*r10*a2 + r01*r11*b2 + r02*r12*c2;
+    A[o+2]=r00*r20*a2 + r01*r21*b2 + r02*r22*c2;
+    B[o]=r10*r10*a2 + r11*r11*b2 + r12*r12*c2;
+    B[o+1]=r10*r20*a2 + r11*r21*b2 + r12*r22*c2;
+    B[o+2]=r20*r20*a2 + r21*r21*b2 + r22*r22*c2;
+
+    // 계수 0 = DC (base 의 색 자리), 1..15 = f_rest. 원본 ply 는 채널 우선이라
+    // R계수1..15, G계수1..15, B계수1..15 순으로 들어 있다.
+    const t0 = (i*16)*4;
+    SH[t0]   = (u8[bo+24]-128)/127*DCR;
+    SH[t0+1] = (u8[bo+25]-128)/127*DCR;
+    SH[t0+2] = (u8[bo+26]-128)/127*DCR;
+    const so = i*45;
+    for (let k = 0; k < 15; k++) {
+      const t = (i*16 + k + 1)*4;
+      SH[t]   = (shu[so + k]      - 128)/127*RANGE;
+      SH[t+1] = (shu[so + 15 + k] - 128)/127*RANGE;
+      SH[t+2] = (shu[so + 30 + k] - 128)/127*RANGE;
+    }
+  }
+
+  cx=(mnx+mxx)/2; cy=(mny+mxy)/2; cz=(mnz+mxz)/2;
+  radius = Math.max(mxx-mnx, mxy-mny, mxz-mnz)*0.5 || 1;
+
+  texF(0,P,TW,TH); texF(1,A,TW,TH); texF(2,B,TW,TH); texF(3,SH,SHW,SHH);
+  gl.uniform1i(U("uPos"),0); gl.uniform1i(U("uCovA"),1);
+  gl.uniform1i(U("uCovB"),2); gl.uniform1i(U("uSH"),3);
+  gl.uniform1i(U("uTexW"), TW); gl.uniform1i(U("uShW"), SHW);
+
+  depthArr = new Float32Array(n);
+  orderBuf = new Float32Array(n);
+  const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+  const qb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, qb);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, 1,1, -1,1]), gl.STATIC_DRAW);
+  const la = gl.getAttribLocation(prog,"aCorner");
+  gl.enableVertexAttribArray(la); gl.vertexAttribPointer(la,2,gl.FLOAT,false,0,0);
+  idxBuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, idxBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, orderBuf, gl.DYNAMIC_DRAW);
+  const li = gl.getAttribLocation(prog,"aIdx");
+  gl.enableVertexAttribArray(li); gl.vertexAttribPointer(li,1,gl.FLOAT,false,0,0);
+  gl.vertexAttribDivisor(li,1);
+
+  document.getElementById("n").textContent = n.toLocaleString();
+  document.getElementById("load").remove();
+  resetView();
+}
+
+const BUCK = 65536;
+const cnt = new Uint32Array(BUCK);
+let bi = null;
+function sortSplats(R, eye) {
+  const r20=R[2], r21=R[5], r22=R[8];
+  let mn=1e30, mx=-1e30;
+  for (let i=0;i<N;i++) {
+    const d = r20*(posArr[i*3]-eye[0]) + r21*(posArr[i*3+1]-eye[1]) + r22*(posArr[i*3+2]-eye[2]);
+    depthArr[i]=d; if(d<mn)mn=d; if(d>mx)mx=d;
+  }
+  cnt.fill(0);
+  const k = mx>mn ? (BUCK-1)/(mx-mn) : 0;
+  if (!bi) bi = new Uint16Array(N);
+  for (let i=0;i<N;i++){ const b=(depthArr[i]-mn)*k|0; bi[i]=b; cnt[b]++; }
+  let s=0; const start=new Uint32Array(BUCK);
+  for (let b=BUCK-1;b>=0;b--){ start[b]=s; s+=cnt[b]; }
+  for (let i=0;i<N;i++) orderBuf[start[bi[i]]++]=i;
+  gl.bindBuffer(gl.ARRAY_BUFFER, idxBuf);
+  gl.bufferSubData(gl.ARRAY_BUFFER, 0, orderBuf);
+}
+
+let yaw=0, pitch=0, dist=3, tgt=[0,0,0], fov=60;
+// 첫 화면은 촬영 카메라 한 대의 자세를 그대로 쓴다.
+// 무게중심에서 임의 방향으로 두면 하필 뒷면이 걸리는데, 이 촬영은 위쪽 반구
+// 위주라 뒷면·아랫면이 뭉개져 있다. 열자마자 그걸 보면 안 된다.
+// (sparse/0 의 img_070 카메라에서 뽑은 값)
+const HOME = { yaw:-0.3754, pitch:0.0025, dist:3.0, tgt:[-0.2626,-0.0135,1.9098], fov:42.3 };
+function resetView(){
+  yaw=HOME.yaw; pitch=HOME.pitch; dist=HOME.dist; tgt=HOME.tgt.slice(); fov=HOME.fov;
+  dirty=true;
+}
+document.getElementById("reset").onclick = resetView;
+function rotMat(){
+  const cy_=Math.cos(yaw), sy=Math.sin(yaw), cp=Math.cos(pitch), sp=Math.sin(pitch);
+  return new Float32Array([cy_, sy*sp, sy*cp,  0, cp, -sp,  -sy, cy_*sp, cy_*cp]);
+}
+function eyePos(){ const R=rotMat();
+  return [tgt[0]-R[2]*dist, tgt[1]-R[5]*dist, tgt[2]-R[8]*dist]; }
+
+let dirty=true, drag=0, lx=0, ly=0;
+CV.addEventListener("contextmenu", e=>e.preventDefault());
+CV.addEventListener("pointerdown", e=>{ drag=e.button===2?2:1; lx=e.clientX; ly=e.clientY; CV.setPointerCapture(e.pointerId); });
+CV.addEventListener("pointerup", ()=>{ drag=0; });
+CV.addEventListener("pointermove", e=>{
+  if(!drag) return;
+  const dx=e.clientX-lx, dy=e.clientY-ly; lx=e.clientX; ly=e.clientY;
+  if(drag===1){ yaw-=dx*0.005; pitch=Math.max(-1.55,Math.min(1.55,pitch-dy*0.005)); }
+  else { const R=rotMat(), k=dist*0.0015;
+         tgt[0]-=(R[0]*dx - R[1]*dy)*k; tgt[1]-=(R[3]*dx - R[4]*dy)*k; tgt[2]-=(R[6]*dx - R[7]*dy)*k; }
+  dirty=true;
+}, {passive:true});
+CV.addEventListener("wheel", e=>{ e.preventDefault();
+  dist*=Math.exp(e.deltaY*0.0012); dist=Math.max(radius*0.15, Math.min(radius*40, dist)); dirty=true;
+}, {passive:false});
+
+gl.disable(gl.DEPTH_TEST);
+gl.enable(gl.BLEND);
+gl.blendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+
+let W=0,H=0,tPrev=performance.now(),frames=0;
+function frame(){
+  const dpr=Math.min(devicePixelRatio||1, 1.75);
+  const w=Math.round(CV.clientWidth*dpr), h=Math.round(CV.clientHeight*dpr);
+  if(w!==W||h!==H){ W=w;H=h; CV.width=W; CV.height=H; gl.viewport(0,0,W,H); dirty=true; }
+  if(N && dirty){
+    const R=rotMat(), eye=eyePos();
+    sortSplats(R,eye);
+    const f = 0.5*H/Math.tan(fov*Math.PI/360);
+    gl.uniformMatrix3fv(U("uR"), false, R);
+    gl.uniform3fv(U("uEye"), eye);
+    gl.uniform2f(U("uFocal"), f, f);
+    gl.uniform2f(U("uSize"), W, H);
+    gl.clearColor(0.043,0.051,0.063,1); gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.drawArraysInstanced(gl.TRIANGLE_FAN, 0, 4, N);
+    dirty=false;
+  }
+  frames++;
+  const now=performance.now();
+  if(now-tPrev>500){
+    document.getElementById("fps").textContent =
+      (frames*1000/(now-tPrev)).toFixed(0)+" fps · 거리 "+dist.toFixed(2);
+    frames=0; tPrev=now;
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+setInterval(()=>{ if(drag) dirty=true; }, 16);
+
+fetch("motor.splatsh")
+  .then(r => { if(!r.ok) throw new Error("motor.splatsh 를 못 읽었습니다 ("+r.status+")"); return r.arrayBuffer(); })
+  .then(build)
+  .catch(e => { document.getElementById("err").textContent = e.message;
+                const l=document.getElementById("load"); if(l) l.textContent = e.message; });
+</script>

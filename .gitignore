@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 스캔 결과물 — 크고 사진마다 다르다. 저장소에 넣지 않는다.
+_scan/
+_out/
+_vggt_out/
+_gof/
+_model/
+_work/
+*.ply
+*.stl
+*.obj
+*.splat
+*.splatsh
+*.npz
+*.pth
+*.pt
+*.safetensors
+
+# 촬영 사진
+*.jpg
+*.jpeg
+*.JPG
+
+# 단, 뷰어 템플릿과 문서 이미지는 넣는다
+!viewer/*.html
+!docs/**/*.png
+
+# 백업·임시
+*.bak
+*.orig
+*.rej
+*.log
+tmp/
+
+# 로컬 설정 (설치 스크립트가 PC 마다 다시 만든다)
+config.json
+.claude/
+
+# OS
+Thumbs.db
+.DS_Store
+desktop.ini

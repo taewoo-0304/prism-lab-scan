@@ -1,0 +1,119 @@
+diff --git a/arguments/__init__.py b/arguments/__init__.py
+index 65e715b..678712c 100644
+--- a/arguments/__init__.py
++++ b/arguments/__init__.py
+@@ -93,6 +93,9 @@ class OptimizationParams(ParamGroup):
+         self.lambda_dssim = 0.2
+         self.lambda_distortion = 100
+         self.lambda_depth_normal = 0.05
++        # 물체 마스크(RGBA 알파) 감독 가중치. 0 이면 원본 GOF 와 동일하게 동작한다.
++        # train.py 의 '마스크 손실' 블록에서 쓴다.
++        self.lambda_mask = 1.0
+         self.distortion_from_iter = 15000
+         self.depth_normal_from_iter = 15000
+         self.densification_interval = 100
+diff --git a/train.py b/train.py
+index 03c7630..6fe1f81 100644
+--- a/train.py
++++ b/train.py
+@@ -149,10 +149,36 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+         rendering, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+         
+         image = rendering[:3, :, :]
+-        
++
+         # rgb Loss
+         gt_image = viewpoint_cam.original_image.cuda()
+-        
++
++        # ---- 물체 마스크를 손실에 반영 (원본 GOF 에는 없는 부분) ----
++        #
++        # 왜 필요한가 — gof_prep.py 가 SAM 마스크를 이미지 알파로 구워 넣어도,
++        # 원본 GOF 는 gt_alpha_mask 를 extract_mesh_tsdf.py 에서만 쓴다.
++        # train.py 는 한 번도 참조하지 않고(2026-09-06 확인), scene/cameras.py:44
++        # 의 `original_image *= gt_alpha_mask` 줄도 주석 처리돼 있다. 그래서
++        # 배경을 지운 점군으로 시작해도 학습이 사진 속 방을 보고 배경 가우시안을
++        # 새로 만들어낸다. 실측(0831_2058, 15000 iter): 렌더에 책상·케이블·벽이
++        # 그대로 나왔다.
++        #
++        # 두 갈래로 막는다.
++        #   1) GT 의 배경을 렌더 배경색으로 덮는다. 렌더도 같은 색 위에 합성되므로
++        #      '물체 밖에서는 알파가 0 이어야 한다' 가 그대로 RGB 손실이 된다.
++        #      GT 만 검게 만들면 물체 경계에 검은 테가 끼지만, 렌더와 배경색이
++        #      같으므로 그 문제는 생기지 않는다.
++        #   2) 누적 알파(채널 7)를 마스크에 직접 맞춘다. 1) 만으로는 배경에 뜬
++        #      가우시안이 배경색과 같은 색이면 손실이 0 이라 살아남는다.
++        obj_mask = getattr(viewpoint_cam, "gt_alpha_mask", None)
++        if obj_mask is not None and opt.lambda_mask > 0:
++            obj_mask = obj_mask.cuda().float()
++            if obj_mask.dim() == 2:
++                obj_mask = obj_mask[None]
++            gt_image = gt_image * obj_mask + background[:, None, None] * (1.0 - obj_mask)
++        else:
++            obj_mask = None
++
+         Ll1 = l1_loss(image, gt_image)
+         # use L1 loss for the transformed image if using decoupled appearance
+         if dataset.use_decoupled_appearance:
+@@ -164,7 +190,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+         distortion_map = rendering[8, :, :]
+         # edge aware regularization is not really helpful so we disable it
+         # distortion_map = get_edge_aware_distortion_map(gt_image, distortion_map)
+-        distortion_loss = distortion_map.mean()
++        # 마스크가 있으면 물체 안에서만 평균낸다. 배경 픽셀까지 넣으면 정규화가
++        # 배경 깊이를 다듬는 데 쓰이고, 그건 우리가 없애려는 바로 그 가우시안이다.
++        if obj_mask is not None:
++            m2 = obj_mask[0]
++            distortion_loss = (distortion_map * m2).sum() / m2.sum().clamp_min(1.0)
++        else:
++            distortion_loss = distortion_map.mean()
+         
+         # depth normal consistency
+         depth = rendering[6, :, :]
+@@ -179,13 +211,25 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+         render_normal_world = normal2.reshape(3, *render_normal.shape[1:])
+         
+         normal_error = 1 - (render_normal_world * depth_normal).sum(dim=0)
+-        depth_normal_loss = normal_error.mean()
+-        
++        if obj_mask is not None:
++            m2 = obj_mask[0]
++            depth_normal_loss = (normal_error * m2).sum() / m2.sum().clamp_min(1.0)
++        else:
++            depth_normal_loss = normal_error.mean()
++
+         lambda_distortion = opt.lambda_distortion if iteration >= opt.distortion_from_iter else 0.0
+         lambda_depth_normal = opt.lambda_depth_normal if iteration >= opt.depth_normal_from_iter else 0.0
+-        
++
++        # 누적 알파를 마스크에 맞춘다 (채널 7). 배경에서 알파를 0 으로 눌러서
++        # 배경 가우시안이 아예 생기지 않게 한다.
++        mask_loss = torch.tensor(0.0, device=image.device)
++        if obj_mask is not None:
++            mask_loss = torch.abs(rendering[7:8, :, :] - obj_mask).mean()
++
+         # Final loss
+-        loss = rgb_loss + depth_normal_loss * lambda_depth_normal + distortion_loss * lambda_distortion
++        loss = (rgb_loss + depth_normal_loss * lambda_depth_normal
++                + distortion_loss * lambda_distortion
++                + mask_loss * opt.lambda_mask)
+         loss.backward()
+         
+         iter_end.record()
+@@ -323,6 +367,16 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
+                     normal = rendering[3:6, :, :]
+                     image = torch.clamp(image, 0.0, 1.0)
+                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
++                    # 학습이 배경을 배경색으로 지우도록 감독받으므로, 지표도 같은
++                    # 기준으로 재야 한다. 안 그러면 학습이 제대로 될수록 PSNR 이
++                    # 떨어진다 (실측: 마스크 학습 200 iter 에서 PSNR 4.9 로 표시됐다).
++                    _m = getattr(viewpoint, "gt_alpha_mask", None)
++                    if _m is not None:
++                        _m = _m.to(gt_image.device).float()
++                        if _m.dim() == 2:
++                            _m = _m[None]
++                        _bg = renderArgs[1][:, None, None]
++                        gt_image = gt_image * _m + _bg * (1.0 - _m)
+                     if tb_writer and (idx < 5):
+                         tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
+                         if iteration == testing_iterations[0]:

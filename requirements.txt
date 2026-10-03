@@ -1,0 +1,33 @@
+# PC(계산) 쪽 파이썬 패키지.
+#
+# 보통은 직접 설치할 필요 없다 — VGGT-Server.bat 을 처음 실행하면
+# setup_laptop.py 가 가상환경(~/vggt_server/venv)을 만들고 아래를 설치한다.
+# 그때 VGGT 소스와 모델 가중치도 받는다.
+#
+# torch 는 CUDA 빌드를 받아야 한다. setup_laptop.py 가 GPU 를 보고 고른다.
+# 수동 설치라면:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+
+torch
+torchvision
+transformers        # SAM 3 (facebook/sam3)
+accelerate
+huggingface_hub
+safetensors
+einops
+
+numpy
+scipy
+scikit-learn
+scikit-image        # 실루엣 카빙 (marching cubes)
+pillow
+matplotlib
+trimesh
+open3d              # 점군 정리·메쉬. setup_laptop.py 원본에는 빠져 있었다
+plyfile             # 가우시안 ply 읽기·변환
+
+flask               # VGGT 서버
+requests
+
+# 선택
+# mujoco            # rig_poses.py (리그 정기구학) 만 쓴다
